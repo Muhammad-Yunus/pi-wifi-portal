@@ -482,6 +482,7 @@ def _perform_handoff(server):
 
     # NOW shutdown server and exit
     print("[wifi-portal] Shutting down portal server...", flush=True)
+    server.server_close()  # Critical: closes socket, releases port 80
     server.shutdown()
     print("[wifi-portal] Exit 0 - portal done.", flush=True)
     os._exit(0)
