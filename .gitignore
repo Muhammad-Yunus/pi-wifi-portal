@@ -1,1 +1,8 @@
-abc
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.env
+*.bak
+install.sh
+uninstall.sh
