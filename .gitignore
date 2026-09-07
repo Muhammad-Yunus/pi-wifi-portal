@@ -1,6 +1,54 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# IDE & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build & dist
+build/
+dist/
+*.egg-info/
+
+# Logs
 *.log
+logs/
+
+# Environment variables
 .env
+.env.local
+
+# Backup files
 *.bak
+*.old
+*.orig
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node (if any)
+node_modules/
+npm-debug.log
+
+# Temp files
+*.tmp
+*.temp
