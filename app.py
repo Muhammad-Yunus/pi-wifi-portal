@@ -193,6 +193,17 @@ def ensure_hotspot() -> bool:
     _run(["nmcli", "connection", "modify", HOTSPOT_SSID,
           "802-11-wireless-security.key-mgmt", "none"])
 
+    # Add iptables DNAT rules for captive portal
+    print("[wifi-portal] Adding iptables DNAT rules for hotspot...", flush=True)
+    _run(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp",
+          "--dport", "80", "-j", "DNAT", "--to-destination", f"{HOST_IP}:80"])
+    _run(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp",
+          "--dport", "53", "-j", "DNAT", "--to-destination", f"{HOST_IP}:53"])
+    _run(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", "udp",
+          "--dport", "53", "-j", "DNAT", "--to-destination", f"{HOST_IP}:53"])
+    _run(["iptables", "-t", "nat", "-A", "POSTROUTING",
+          "-s", "10.42.0.0/24", "-j", "MASQUERADE"])
+
     # Validate: confirm key-mgmt is actually none
     time.sleep(1)
     code4, out4, _ = _run(["nmcli", "-t", "-f",
@@ -302,6 +313,18 @@ def _restore_hotspot() -> None:
     _run(["nmcli", "connection", "up", HOTSPOT_SSID])
     _run(["nmcli", "connection", "modify", HOTSPOT_SSID,
           "802-11-wireless-security.key-mgmt", "none"])
+    
+    # Add iptables DNAT rules for captive portal
+    print("[wifi-portal] Adding iptables DNAT rules for hotspot...", flush=True)
+    _run(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp",
+          "--dport", "80", "-j", "DNAT", "--to-destination", f"{HOST_IP}:80"])
+    _run(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp",
+          "--dport", "53", "-j", "DNAT", "--to-destination", f"{HOST_IP}:53"])
+    _run(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", "udp",
+          "--dport", "53", "-j", "DNAT", "--to-destination", f"{HOST_IP}:53"])
+    _run(["iptables", "-t", "nat", "-A", "POSTROUTING",
+          "-s", "10.42.0.0/24", "-j", "MASQUERADE"])
+    
     print(f"[wifi-portal] Hotspot '{HOTSPOT_SSID}' restored (open).", flush=True)
 
 
