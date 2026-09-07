@@ -460,18 +460,20 @@ def _perform_handoff(server):
     # Wait for client to receive redirect (3 seconds)
     time.sleep(3)
 
-    # Shutdown server (stop accept new connections)
-    print("[wifi-portal] Shutting down portal server...", flush=True)
-    server.shutdown()
-
-    # Wait until port 80 is truly free (critical - don't race with nginx)
+    # Wait until port 80 is truly free (CRITICAL - don't kill server yet)
+    # Do NOT call server.shutdown() here - it kills the main thread
     print("[wifi-portal] Waiting for port 80 to free...", flush=True)
-    for i in range(10):
+    port_free = False
+    for i in range(10):  # Max 5 seconds
         time.sleep(0.5)
         if _wait_port_free(timeout=1):
+            port_free = True
             print(f"[wifi-portal] Port 80 freed after {i+1} tries", flush=True)
             break
         print(f"[wifi-portal] Waiting... {i+1}/10", flush=True)
+    
+    if not port_free:
+        print("[wifi-portal] WARNING: Port 80 still in use, forcing nginx start anyway", flush=True)
 
     # Remove hotspot iptables DNAT rules (CRITICAL - otherwise nginx can't serve)
     print("[wifi-portal] Removing hotspot iptables rules...", flush=True)
@@ -481,7 +483,9 @@ def _perform_handoff(server):
     print("[wifi-portal] Starting nginx...", flush=True)
     _start_nginx()
 
-    # Kill Python process - portal done
+    # NOW shutdown server and exit
+    print("[wifi-portal] Shutting down portal server...", flush=True)
+    server.shutdown()
     print("[wifi-portal] Exit 0 - portal done.", flush=True)
     os._exit(0)
 
