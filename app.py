@@ -659,6 +659,9 @@ def main():
     # 2. Check if already connected to a WiFi AP
     if _is_wifi_connected_to_ap():
         print("[wifi-portal] WiFi already connected, starting nginx...", flush=True)
+        # Flush any stale iptables rules from previous hotspot sessions
+        print("[wifi-portal] Flushing stale iptables rules...", flush=True)
+        _flush_hotspot_iptables()
         _stop_nginx()
         _start_nginx()
         print("[wifi-portal] Exit 0 - WiFi connected, no portal needed.", flush=True)
