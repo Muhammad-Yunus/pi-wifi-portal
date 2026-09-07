@@ -451,39 +451,43 @@ def _flush_hotspot_iptables() -> None:
 
 def _perform_handoff(server):
     """Shutdown portal, remove iptables, start nginx, exit clean."""
-    global _server_instance
     print("[wifi-portal] Handoff to nginx triggered.", flush=True)
 
     # Wait for client to receive redirect (3 seconds)
     time.sleep(3)
 
-    # Wait until port 80 is truly free (CRITICAL - don't kill server yet)
-    # Do NOT call server.shutdown() here - it kills the main thread
+    # Step 1: Shutdown server FIRST (stop accepting new connections)
+    print("[wifi-portal] Stopping portal server...", flush=True)
+    server.shutdown()
+
+    # Step 2: Close socket to release port 80
+    print("[wifi-portal] Closing socket...", flush=True)
+    server.server_close()
+
+    # Step 3: Wait for port to be truly free
     print("[wifi-portal] Waiting for port 80 to free...", flush=True)
     port_free = False
-    for i in range(10):  # Max 5 seconds
+    for i in range(20):  # Max 10 seconds
         time.sleep(0.5)
-        if _wait_port_free(timeout=1):
+        code, out, _ = _run(["ss", "-tlnp"], timeout=3)
+        if code == 0 and ":80 " not in out:
             port_free = True
             print(f"[wifi-portal] Port 80 freed after {i+1} tries", flush=True)
             break
-        print(f"[wifi-portal] Waiting... {i+1}/10", flush=True)
-    
-    if not port_free:
-        print("[wifi-portal] WARNING: Port 80 still in use, forcing nginx start anyway", flush=True)
+        print(f"[wifi-portal] Waiting... {i+1}/20", flush=True)
 
-    # Remove hotspot iptables DNAT rules (CRITICAL - otherwise nginx can't serve)
+    if not port_free:
+        print("[wifi-portal] WARNING: Port 80 still in use!", flush=True)
+
+    # Step 4: Remove hotspot iptables rules
     print("[wifi-portal] Removing hotspot iptables rules...", flush=True)
     _flush_hotspot_iptables()
 
-    # Start nginx
+    # Step 5: Start nginx (port should be free now)
     print("[wifi-portal] Starting nginx...", flush=True)
     _start_nginx()
 
-    # NOW shutdown server and exit
-    print("[wifi-portal] Shutting down portal server...", flush=True)
-    server.server_close()  # Critical: closes socket, releases port 80
-    server.shutdown()
+    # Step 6: Exit
     print("[wifi-portal] Exit 0 - portal done.", flush=True)
     os._exit(0)
 
