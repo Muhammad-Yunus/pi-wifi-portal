@@ -412,27 +412,55 @@ class PortalHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def _flush_hotspot_iptables() -> None:
+    """Remove all hotspot-related iptables DNAT/MASQUERADE rules."""
+    # Remove all PREROUTING DNAT rules for port 80 and 53
+    _run(["iptables", "-t", "nat", "-D", "PREROUTING",
+          "-p", "tcp", "--dport", "80", "-j", "DNAT",
+          "--to-destination", f"{HOST_IP}:80"], timeout=3)
+    _run(["iptables", "-t", "nat", "-D", "PREROUTING",
+          "-p", "tcp", "--dport", "53", "-j", "DNAT",
+          "--to-destination", f"{HOST_IP}:53"], timeout=3)
+    _run(["iptables", "-t", "nat", "-D", "PREROUTING",
+          "-p", "udp", "--dport", "53", "-j", "DNAT",
+          "--to-destination", f"{HOST_IP}:53"], timeout=3)
+    # Remove MASQUERADE rule
+    _run(["iptables", "-t", "nat", "-D", "POSTROUTING",
+          "-s", "10.42.0.0/24", "-j", "MASQUERADE"], timeout=3)
+
+
 def _perform_handoff(server):
-    """Shutdown portal, start nginx, exit clean."""
+    """Shutdown portal, remove iptables, start nginx, exit clean."""
     global _server_instance
     print("[wifi-portal] Handoff to nginx triggered.", flush=True)
-    
+
     # Wait for client to receive redirect (3 seconds)
     time.sleep(3)
-    
-    # Shutdown server to release port 80
+
+    # Shutdown server (stop accept new connections)
     print("[wifi-portal] Shutting down portal server...", flush=True)
     server.shutdown()
-    
-    # Wait for port to be truly free
-    if _wait_port_free(timeout=5):
-        print("[wifi-portal] Port 80 freed, starting nginx...", flush=True)
-        _start_nginx()
-        print("[wifi-portal] Exit 0 - portal done.", flush=True)
-        os._exit(0)
-    else:
-        print("[wifi-portal] ERROR: Port 80 still in use after 5s!", flush=True)
-        os._exit(1)
+
+    # Wait until port 80 is truly free (critical - don't race with nginx)
+    print("[wifi-portal] Waiting for port 80 to free...", flush=True)
+    for i in range(10):
+        time.sleep(0.5)
+        if _wait_port_free(timeout=1):
+            print(f"[wifi-portal] Port 80 freed after {i+1} tries", flush=True)
+            break
+        print(f"[wifi-portal] Waiting... {i+1}/10", flush=True)
+
+    # Remove hotspot iptables DNAT rules (CRITICAL - otherwise nginx can't serve)
+    print("[wifi-portal] Removing hotspot iptables rules...", flush=True)
+    _flush_hotspot_iptables()
+
+    # Start nginx
+    print("[wifi-portal] Starting nginx...", flush=True)
+    _start_nginx()
+
+    # Kill Python process - portal done
+    print("[wifi-portal] Exit 0 - portal done.", flush=True)
+    os._exit(0)
 
 
 # ── Embedded HTML page (single-file, no external assets) ─────────────────
@@ -607,9 +635,11 @@ def main():
         print("[wifi-portal] Exit 0 - WiFi connected, no portal needed.", flush=True)
         return
 
-    # 3. Stop nginx to free port 80
+    # 3. Stop nginx and flush any stale iptables rules
     print("[wifi-portal] Stopping nginx...", flush=True)
     _stop_nginx()
+    print("[wifi-portal] Flushing stale iptables rules...", flush=True)
+    _flush_hotspot_iptables()
     if not _wait_port_free(timeout=10):
         print("[wifi-portal] ERROR: Port 80 still in use!", flush=True)
         return
