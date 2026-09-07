@@ -4,5 +4,3 @@ __pycache__/
 *.log
 .env
 *.bak
-install.sh
-uninstall.sh
