@@ -14,10 +14,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST_IP = "10.42.0.1"
 HOTSPOT_SSID = None  # set at startup from hostname
+_PORTAL_PORT = 3001  # Captive portal runs on port 3001 (no port 80)
 
 # Global server reference for handoff
 _server_instance = None
-_handoff_requested = threading.Event()
 
 
 def _run(cmd: list[str], timeout: int = 15) -> tuple[int, str, str]:
@@ -59,30 +59,6 @@ def _is_wifi_connected_to_ap() -> bool:
                                     "connection", "show", parts[0]], timeout=5)
             if code2 == 0 and out2.strip() and out2.strip() != "ap":
                 return True
-    return False
-
-
-def _stop_nginx() -> None:
-    """Stop nginx service."""
-    _run(["systemctl", "stop", "nginx"])
-    print("[wifi-portal] nginx stopped.", flush=True)
-
-
-def _start_nginx() -> None:
-    """Start nginx service."""
-    _run(["systemctl", "start", "nginx"])
-    print("[wifi-portal] nginx started.", flush=True)
-
-
-def _wait_port_free(port: int = 80, timeout: int = 15) -> bool:
-    """Wait until port is free for binding."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        # Use ss to check if port is in LISTEN state (more reliable than bind test)
-        code, out, _ = _run(["ss", "-tlnp"], timeout=3)
-        if code == 0 and f":{port} " not in out:
-            return True
-        time.sleep(0.5)
     return False
 
 
@@ -193,7 +169,7 @@ def ensure_hotspot() -> bool:
     # Add iptables DNAT rules for captive portal
     print("[wifi-portal] Adding iptables DNAT rules for hotspot...", flush=True)
     _run(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp",
-          "--dport", "80", "-j", "DNAT", "--to-destination", f"{HOST_IP}:80"])
+          "--dport", "80", "-j", "DNAT", "--to-destination", f"{HOST_IP}:{_PORTAL_PORT}"])
     _run(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp",
           "--dport", "53", "-j", "DNAT", "--to-destination", f"{HOST_IP}:53"])
     _run(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", "udp",
@@ -281,48 +257,10 @@ def connect_to_network(ssid: str, password: str) -> dict:
     if ip:
         # Success! Now tear down hotspot so wlan0 can be used for internet
         _run(["nmcli", "connection", "delete", HOTSPOT_SSID or "Hotspot"])
-        # Signal handoff to nginx
-        _handoff_requested.set()
         return {"status": "success", "ip": ip}
     else:
         # Timeout — hotspot still running, user can retry
         return {"status": "failed", "error": "Connection timed out"}
-
-
-def _restore_hotspot() -> None:
-    """Re-create the open hotspot so the user can retry."""
-    global HOTSPOT_SSID
-    if not HOTSPOT_SSID:
-        HOTSPOT_SSID = get_hostname()
-    # Delete any stale profile
-    _run(["nmcli", "connection", "delete", HOTSPOT_SSID])
-    _run(["nmcli", "connection", "delete", "Hotspot"])
-    time.sleep(1)
-    # Always use Method 2 (manual connection) — most reliable
-    _run(["nmcli", "connection", "add",
-          "type", "wifi", "ifname", "wlan0",
-          "con-name", HOTSPOT_SSID,
-          "autoconnect", "no",
-          "wifi.ssid", HOTSPOT_SSID,
-          "wifi.mode", "ap",
-          "ipv4.method", "shared",
-          "ipv6.method", "ignore"])
-    _run(["nmcli", "connection", "up", HOTSPOT_SSID])
-    _run(["nmcli", "connection", "modify", HOTSPOT_SSID,
-          "802-11-wireless-security.key-mgmt", "none"])
-    
-    # Add iptables DNAT rules for captive portal
-    print("[wifi-portal] Adding iptables DNAT rules for hotspot...", flush=True)
-    _run(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp",
-          "--dport", "80", "-j", "DNAT", "--to-destination", f"{HOST_IP}:80"])
-    _run(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp",
-          "--dport", "53", "-j", "DNAT", "--to-destination", f"{HOST_IP}:53"])
-    _run(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", "udp",
-          "--dport", "53", "-j", "DNAT", "--to-destination", f"{HOST_IP}:53"])
-    _run(["iptables", "-t", "nat", "-A", "POSTROUTING",
-          "-s", "10.42.0.0/24", "-j", "MASQUERADE"])
-    
-    print(f"[wifi-portal] Hotspot '{HOTSPOT_SSID}' restored (open).", flush=True)
 
 
 # Shared connection state
@@ -416,7 +354,7 @@ class PortalHandler(BaseHTTPRequestHandler):
             result = connect_to_network(ssid, password)
             with _conn_lock:
                 _conn_status.update(result)
-            # Trigger nginx handoff on success
+            # Trigger handoff on success
             if result.get("status") == "success" and _server_instance:
                 threading.Thread(target=_perform_handoff,
                                  args=(_server_instance,), daemon=True).start()
@@ -437,7 +375,7 @@ def _flush_hotspot_iptables() -> None:
     # Remove all PREROUTING DNAT rules for port 80 and 53
     _run(["iptables", "-t", "nat", "-D", "PREROUTING",
           "-p", "tcp", "--dport", "80", "-j", "DNAT",
-          "--to-destination", f"{HOST_IP}:80"], timeout=3)
+          "--to-destination", f"{HOST_IP}:{_PORTAL_PORT}"], timeout=3)
     _run(["iptables", "-t", "nat", "-D", "PREROUTING",
           "-p", "tcp", "--dport", "53", "-j", "DNAT",
           "--to-destination", f"{HOST_IP}:53"], timeout=3)
@@ -450,44 +388,13 @@ def _flush_hotspot_iptables() -> None:
 
 
 def _perform_handoff(server):
-    """Shutdown portal, remove iptables, start nginx, exit clean."""
-    print("[wifi-portal] Handoff to nginx triggered.", flush=True)
-
-    # Wait for client to receive redirect (3 seconds)
-    time.sleep(3)
-
-    # Step 1: Shutdown server FIRST (stop accepting new connections)
+    """Shutdown portal and exit clean."""
+    print("[wifi-portal] Handoff triggered.", flush=True)
+    time.sleep(3)  # Wait for client redirect
     print("[wifi-portal] Stopping portal server...", flush=True)
     server.shutdown()
-
-    # Step 2: Close socket to release port 80
-    print("[wifi-portal] Closing socket...", flush=True)
-    server.server_close()
-
-    # Step 3: Wait for port to be truly free
-    print("[wifi-portal] Waiting for port 80 to free...", flush=True)
-    port_free = False
-    for i in range(20):  # Max 10 seconds
-        time.sleep(0.5)
-        code, out, _ = _run(["ss", "-tlnp"], timeout=3)
-        if code == 0 and ":80 " not in out:
-            port_free = True
-            print(f"[wifi-portal] Port 80 freed after {i+1} tries", flush=True)
-            break
-        print(f"[wifi-portal] Waiting... {i+1}/20", flush=True)
-
-    if not port_free:
-        print("[wifi-portal] WARNING: Port 80 still in use!", flush=True)
-
-    # Step 4: Remove hotspot iptables rules
     print("[wifi-portal] Removing hotspot iptables rules...", flush=True)
     _flush_hotspot_iptables()
-
-    # Step 5: Start nginx (port should be free now)
-    print("[wifi-portal] Starting nginx...", flush=True)
-    _start_nginx()
-
-    # Step 6: Exit
     print("[wifi-portal] Exit 0 - portal done.", flush=True)
     os._exit(0)
 
@@ -656,37 +563,27 @@ def main():
         print("[wifi-portal] ERROR: NetworkManager not ready. Exiting.", flush=True)
         return
 
-    # 2. Check if already connected to a WiFi AP
+    # 2. If already connected to WiFi AP → no portal needed
     if _is_wifi_connected_to_ap():
-        print("[wifi-portal] WiFi already connected, starting nginx...", flush=True)
-        # Flush any stale iptables rules from previous hotspot sessions
-        print("[wifi-portal] Flushing stale iptables rules...", flush=True)
+        print("[wifi-portal] WiFi already connected, flushing stale iptables...", flush=True)
         _flush_hotspot_iptables()
-        _stop_nginx()
-        _start_nginx()
         print("[wifi-portal] Exit 0 - WiFi connected, no portal needed.", flush=True)
         return
 
-    # 3. Stop nginx and flush any stale iptables rules
-    print("[wifi-portal] Stopping nginx...", flush=True)
-    _stop_nginx()
+    # 3. Flush stale iptables rules
     print("[wifi-portal] Flushing stale iptables rules...", flush=True)
     _flush_hotspot_iptables()
-    if not _wait_port_free(timeout=10):
-        print("[wifi-portal] ERROR: Port 80 still in use!", flush=True)
-        return
 
     # 4. Create hotspot
     print("[wifi-portal] Creating hotspot...", flush=True)
     hotspot_up = ensure_hotspot()
-
     if not hotspot_up:
         print("[wifi-portal] ERROR: Failed to create hotspot.", flush=True)
         return
 
-    # 5. Start threaded HTTP server
-    _server_instance = ThreadingHTTPServer(("0.0.0.0", 80), PortalHandler)
-    print(f"[wifi-portal] Listening on http://0.0.0.0:80", flush=True)
+    # 5. Start server on port 3001
+    _server_instance = ThreadingHTTPServer(("0.0.0.0", _PORTAL_PORT), PortalHandler)
+    print(f"[wifi-portal] Listening on http://0.0.0.0:{_PORTAL_PORT}", flush=True)
     print(f"[wifi-portal] Hotspot SSID: '{HOTSPOT_SSID}' (IP: {HOST_IP})",
           flush=True)
 
