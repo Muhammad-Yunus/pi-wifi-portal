@@ -78,14 +78,11 @@ def _wait_port_free(port: int = 80, timeout: int = 15) -> bool:
     """Wait until port is free for binding."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        import socket as _sock
-        try:
-            s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
-            s.bind(("", port))
-            s.close()
+        # Use ss to check if port is in LISTEN state (more reliable than bind test)
+        code, out, _ = _run(["ss", "-tlnp"], timeout=3)
+        if code == 0 and f":{port} " not in out:
             return True
-        except OSError:
-            time.sleep(0.5)
+        time.sleep(0.5)
     return False
 
 
