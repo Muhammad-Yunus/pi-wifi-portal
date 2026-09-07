@@ -15,6 +15,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HOST_IP = "10.42.0.1"
 HOTSPOT_SSID = None  # set at startup from hostname
 
+# Global server reference for handoff
+_server_instance = None
+_handoff_requested = threading.Event()
+
 
 def _run(cmd: list[str], timeout: int = 15) -> tuple[int, str, str]:
     try:
@@ -37,6 +41,51 @@ def _wait_nm_ready(retries: int = 20, delay: float = 0.5) -> bool:
         if code == 0 and "wifi" in out:
             return True
         time.sleep(delay)
+    return False
+
+
+def _is_wifi_connected_to_ap() -> bool:
+    """Check if wlan0 is connected to an infrastructure AP (not hotspot)."""
+    code, out, _ = _run(["nmcli", "-t", "-f", "NAME,DEVICE",
+                          "connection", "show", "--active"], timeout=5)
+    if code != 0:
+        return False
+    for line in out.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 2 and parts[1] == "wlan0" and parts[0] != HOTSPOT_SSID:
+            # Check if it's AP mode (hotspot) or infrastructure (client)
+            code2, out2, _ = _run(["nmcli", "-t", "-f",
+                                    "802-11-wireless.mode",
+                                    "connection", "show", parts[0]], timeout=5)
+            if code2 == 0 and out2.strip() and out2.strip() != "ap":
+                return True
+    return False
+
+
+def _stop_nginx() -> None:
+    """Stop nginx service."""
+    _run(["systemctl", "stop", "nginx"])
+    print("[wifi-portal] nginx stopped.", flush=True)
+
+
+def _start_nginx() -> None:
+    """Start nginx service."""
+    _run(["systemctl", "start", "nginx"])
+    print("[wifi-portal] nginx started.", flush=True)
+
+
+def _wait_port_free(port: int = 80, timeout: int = 15) -> bool:
+    """Wait until port is free for binding."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        import socket as _sock
+        try:
+            s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+            s.bind(("", port))
+            s.close()
+            return True
+        except OSError:
+            time.sleep(0.5)
     return False
 
 
@@ -224,6 +273,8 @@ def connect_to_network(ssid: str, password: str) -> dict:
     if ip:
         # Success! Now tear down hotspot so wlan0 can be used for internet
         _run(["nmcli", "connection", "delete", HOTSPOT_SSID or "Hotspot"])
+        # Signal handoff to nginx
+        _handoff_requested.set()
         return {"status": "success", "ip": ip}
     else:
         # Timeout — hotspot still running, user can retry
@@ -345,6 +396,10 @@ class PortalHandler(BaseHTTPRequestHandler):
             result = connect_to_network(ssid, password)
             with _conn_lock:
                 _conn_status.update(result)
+            # Trigger nginx handoff on success
+            if result.get("status") == "success" and _server_instance:
+                threading.Thread(target=_perform_handoff,
+                                 args=(_server_instance,), daemon=True).start()
 
         threading.Thread(target=_connect_job, daemon=True).start()
 
@@ -355,6 +410,29 @@ class PortalHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+
+def _perform_handoff(server):
+    """Shutdown portal, start nginx, exit clean."""
+    global _server_instance
+    print("[wifi-portal] Handoff to nginx triggered.", flush=True)
+    
+    # Wait for client to receive redirect (3 seconds)
+    time.sleep(3)
+    
+    # Shutdown server to release port 80
+    print("[wifi-portal] Shutting down portal server...", flush=True)
+    server.shutdown()
+    
+    # Wait for port to be truly free
+    if _wait_port_free(timeout=5):
+        print("[wifi-portal] Port 80 freed, starting nginx...", flush=True)
+        _start_nginx()
+        print("[wifi-portal] Exit 0 - portal done.", flush=True)
+        os._exit(0)
+    else:
+        print("[wifi-portal] ERROR: Port 80 still in use after 5s!", flush=True)
+        os._exit(1)
 
 
 # ── Embedded HTML page (single-file, no external assets) ─────────────────
@@ -489,7 +567,7 @@ async function doConnect() {
       if (data.status === 'success') {
         clearInterval(poll);
         setStatus('success', 'Connected! Redirecting to ' + data.ip + '…');
-        setTimeout(() => { location.href = 'http://' + data.ip; }, 1500);
+        setTimeout(() => { location.href = 'http://' + data.ip; }, 3000);
       } else if (data.status === 'failed') {
         clearInterval(poll);
         setStatus('failed', (data.error||'Connection failed').slice(0,80) +
@@ -513,7 +591,7 @@ refreshScan();
 
 
 def main():
-    global HOTSPOT_SSID
+    global HOTSPOT_SSID, _server_instance
 
     # 1. Wait for NetworkManager to be ready
     print("[wifi-portal] Waiting for NetworkManager…", flush=True)
@@ -521,26 +599,40 @@ def main():
         print("[wifi-portal] ERROR: NetworkManager not ready. Exiting.", flush=True)
         return
 
-    # 2. Ensure hotspot is active (or wlan0 is already connected to something)
-    print("[wifi-portal] Checking Wi-Fi state…", flush=True)
+    # 2. Check if already connected to a WiFi AP
+    if _is_wifi_connected_to_ap():
+        print("[wifi-portal] WiFi already connected, starting nginx...", flush=True)
+        _stop_nginx()
+        _start_nginx()
+        print("[wifi-portal] Exit 0 - WiFi connected, no portal needed.", flush=True)
+        return
+
+    # 3. Stop nginx to free port 80
+    print("[wifi-portal] Stopping nginx...", flush=True)
+    _stop_nginx()
+    if not _wait_port_free(timeout=10):
+        print("[wifi-portal] ERROR: Port 80 still in use!", flush=True)
+        return
+
+    # 4. Create hotspot
+    print("[wifi-portal] Creating hotspot...", flush=True)
     hotspot_up = ensure_hotspot()
 
     if not hotspot_up:
-        # wlan0 might already be connected — just serve the portal
-        print("[wifi-portal] No hotspot to serve. "
-              "Connect a device and browse to http://<pi-ip>.", flush=True)
+        print("[wifi-portal] ERROR: Failed to create hotspot.", flush=True)
+        return
 
-    # 3. Start threaded HTTP server
-    server = ThreadingHTTPServer(("0.0.0.0", 80), PortalHandler)
+    # 5. Start threaded HTTP server
+    _server_instance = ThreadingHTTPServer(("0.0.0.0", 80), PortalHandler)
     print(f"[wifi-portal] Listening on http://0.0.0.0:80", flush=True)
-    if hotspot_up:
-        print(f"[wifi-portal] Hotspot SSID: '{HOTSPOT_SSID}' (IP: {HOST_IP})",
-              flush=True)
+    print(f"[wifi-portal] Hotspot SSID: '{HOTSPOT_SSID}' (IP: {HOST_IP})",
+          flush=True)
+
     try:
-        server.serve_forever()
+        _server_instance.serve_forever()
     except KeyboardInterrupt:
         pass
-    server.server_close()
+    _server_instance.server_close()
 
 
 if __name__ == "__main__":
