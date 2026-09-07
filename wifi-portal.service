@@ -1,0 +1,32 @@
+[Unit]
+Description=Ultra-light Wi-Fi Captive Portal (Bookworm)
+After=NetworkManager.service network-online.target
+Wants=NetworkManager.service network-online.target
+ConditionPathExists=/sys/class/net/wlan0
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/wifi-portal
+ExecStart=/usr/bin/python3 /opt/wifi-portal/app.py
+ExecStartPost=/bin/sh -c '/usr/sbin/iptables -t nat -A PREROUTING -p tcp --dport 80 -j DNAT --to-destination 10.42.0.1:80 2>/dev/null; true'
+ExecStartPost=/bin/sh -c '/usr/sbin/iptables -t nat -A PREROUTING -p tcp --dport 53 -j DNAT --to-destination 10.42.0.1:53 2>/dev/null; true'
+ExecStartPost=/bin/sh -c '/usr/sbin/iptables -t nat -A PREROUTING -p udp --dport 53 -j DNAT --to-destination 10.42.0.1:53 2>/dev/null; true'
+ExecStartPost=/bin/sh -c '/usr/sbin/iptables -t nat -A POSTROUTING -s 10.42.0.0/24 -j MASQUERADE 2>/dev/null; true'
+Restart=always
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wifi-portal
+
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+
+# Allow nginx management
+ProtectSystem=no
+ProtectHome=yes
+ReadWritePaths=/opt/wifi-portal
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
