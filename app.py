@@ -6,6 +6,7 @@ Zero external dependencies — uses only Python 3 standard library.
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import threading
@@ -370,21 +371,83 @@ class PortalHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def _find_hotspot_iptables_rules() -> list[tuple[str, str]]:
+    """Find all wifi-portal related iptables rules by matching unique patterns.
+    
+    Returns list of (chain, rule_spec) tuples.
+    """
+    rules = []
+    
+    # Get PREROUTING rules
+    code, out, _ = _run(["iptables", "-t", "nat", "-S", "PREROUTING"], timeout=5)
+    if code == 0:
+        for line in out.strip().split('\n'):
+            if not line.startswith('-A'):
+                continue
+            # Match our unique patterns
+            if f'--to-destination {HOST_IP}:{_PORTAL_PORT}' in line:
+                rules.append(('PREROUTING', line))
+            elif '--to-destination ' + HOST_IP + ':53' in line:
+                rules.append(('PREROUTING', line))
+    
+    # Get POSTROUTING rules
+    code, out, _ = _run(["iptables", "-t", "nat", "-S", "POSTROUTING"], timeout=5)
+    if code == 0:
+        for line in out.strip().split('\n'):
+            if not line.startswith('-A'):
+                continue
+            if '-s 10.42.0.0/24 -j MASQUERADE' in line:
+                rules.append(('POSTROUTING', line))
+    
+    return rules
+
+
 def _flush_hotspot_iptables() -> None:
-    """Remove all hotspot-related iptables DNAT/MASQUERADE rules."""
-    # Remove all PREROUTING DNAT rules for port 80 and 53
-    _run(["iptables", "-t", "nat", "-D", "PREROUTING",
-          "-p", "tcp", "--dport", "80", "-j", "DNAT",
-          "--to-destination", f"{HOST_IP}:{_PORTAL_PORT}"], timeout=3)
-    _run(["iptables", "-t", "nat", "-D", "PREROUTING",
-          "-p", "tcp", "--dport", "53", "-j", "DNAT",
-          "--to-destination", f"{HOST_IP}:53"], timeout=3)
-    _run(["iptables", "-t", "nat", "-D", "PREROUTING",
-          "-p", "udp", "--dport", "53", "-j", "DNAT",
-          "--to-destination", f"{HOST_IP}:53"], timeout=3)
-    # Remove MASQUERADE rule
-    _run(["iptables", "-t", "nat", "-D", "POSTROUTING",
-          "-s", "10.42.0.0/24", "-j", "MASQUERADE"], timeout=3)
+    """Remove all hotspot-related iptables rules with verification.
+    
+    Uses Identify → Delete → Verify → Fallback approach for guaranteed cleanup.
+    """
+    print("[wifi-portal] Starting iptables cleanup...", flush=True)
+    
+    # Step 1: Identify rules to delete
+    rules = _find_hotspot_iptables_rules()
+    print(f"[wifi-portal] Found {len(rules)} hotspot rules to delete", flush=True)
+    
+    if not rules:
+        print("[wifi-portal] No rules to delete", flush=True)
+        return
+    
+    # Step 2: Delete each rule with logging
+    deleted = 0
+    failed = []
+    for chain, rule_spec in rules:
+        # Convert -A to -D
+        parts = rule_spec.split()
+        if parts[0] == '-A':
+            parts[0] = '-D'
+            cmd = ["iptables", "-t", chain] + parts[1:]
+            
+            print(f"[wifi-portal] Deleting: {' '.join(parts[1:])}", flush=True)
+            
+            result = _run(cmd, timeout=5)
+            if result[0] == 0:
+                deleted += 1
+                print(f"[wifi-portal] ✓ Deleted successfully", flush=True)
+            else:
+                print(f"[wifi-portal] ✗ Delete failed: {result[2]}", flush=True)
+                failed.append(rule_spec)
+    
+    # Step 3: Verify cleanup
+    remaining = _find_hotspot_iptables_rules()
+    if remaining:
+        print(f"[wifi-portal] ⚠ WARNING: {len(remaining)} rules still remain!", flush=True)
+        print("[wifi-portal] Falling back to force flush...", flush=True)
+        # Fallback: Force flush the chains
+        _run(["iptables", "-t", "nat", "-F", "PREROUTING"], timeout=5)
+        _run(["iptables", "-t", "nat", "-F", "POSTROUTING"], timeout=5)
+        print("[wifi-portal] Force flush completed", flush=True)
+    else:
+        print(f"[wifi-portal] ✓ Cleanup verified: All {deleted} rules removed", flush=True)
 
 
 def _perform_handoff(server):
@@ -396,6 +459,19 @@ def _perform_handoff(server):
     print("[wifi-portal] Removing hotspot iptables rules...", flush=True)
     _flush_hotspot_iptables()
     print("[wifi-portal] Exit 0 - portal done.", flush=True)
+    os._exit(0)
+
+
+def _signal_handler(sig, frame):
+    """Handle SIGINT and SIGTERM to ensure iptables cleanup."""
+    print(f"\n[wifi-portal] Received signal {sig}, cleaning up...", flush=True)
+    _flush_hotspot_iptables()
+    if _server_instance:
+        try:
+            _server_instance.shutdown()
+        except:
+            pass
+    print("[wifi-portal] Cleanup complete, exiting.", flush=True)
     os._exit(0)
 
 
@@ -590,9 +666,17 @@ def main():
     try:
         _server_instance.serve_forever()
     except KeyboardInterrupt:
-        pass
-    _server_instance.server_close()
+        print("[wifi-portal] KeyboardInterrupt received, cleaning up...", flush=True)
+    finally:
+        # Ensure iptables cleanup on any exit path
+        print("[wifi-portal] Performing final iptables cleanup...", flush=True)
+        _flush_hotspot_iptables()
+        if _server_instance:
+            _server_instance.server_close()
 
 
 if __name__ == "__main__":
+    # Register signal handlers for guaranteed cleanup
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
     main()

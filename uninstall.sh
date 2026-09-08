@@ -48,10 +48,56 @@ fi
 
 # ── Clean iptables rules ────────────────────────────────────
 echo "🧹 Cleaning iptables rules..."
-iptables -t nat -D PREROUTING -p tcp --dport 80 -j DNAT --to-destination 10.42.0.1:3001 2>/dev/null || true
-iptables -t nat -D PREROUTING -p tcp --dport 53 -j DNAT --to-destination 10.42.0.1:53 2>/dev/null || true
-iptables -t nat -D PREROUTING -p udp --dport 53 -j DNAT --to-destination 10.42.0.1:53 2>/dev/null || true
-iptables -t nat -D POSTROUTING -s 10.42.0.0/24 -j MASQUERADE 2>/dev/null || true
+
+# Identify rules to delete
+echo "🔍 Identifying hotspot iptables rules..."
+RULES=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -E "(to:10\.42\.0\.1:3001|to:10\.42\.0\.1:53)" || true)
+RULES_POST=$(iptables -t nat -S POSTROUTING 2>/dev/null | grep -E "10\.42\.0\.0/24.*MASQUERADE" || true)
+
+if [ -n "$RULES" ] || [ -n "$RULES_POST" ]; then
+    echo "📋 Found rules to delete:"
+    [ -n "$RULES" ] && echo "  PREROUTING: $RULES"
+    [ -n "$RULES_POST" ] && echo "  POSTROUTING: $RULES_POST"
+    
+    # Delete identified rules
+    echo "🗑️  Deleting identified rules..."
+    DELETED=0
+    while IFS= read -r line; do
+        if [ -n "$line" ]; then
+            # Convert -A to -D
+            DELETE_LINE=$(echo "$line" | sed 's/^-A/-D/')
+            CHAIN=$(echo "$DELETE_LINE" | awk '{print $2}')
+            RULE=$(echo "$DELETE_LINE" | cut -d' ' -f3-)
+            iptables -t "$CHAIN" -D $RULE 2>/dev/null && echo "  ✓ Deleted: $RULE" && DELETED=$((DELETED+1)) || echo "  ✗ Failed: $RULE"
+        fi
+    done <<< "$RULES"
+    
+    while IFS= read -r line; do
+        if [ -n "$line" ]; then
+            DELETE_LINE=$(echo "$line" | sed 's/^-A/-D/')
+            CHAIN=$(echo "$DELETE_LINE" | awk '{print $2}')
+            RULE=$(echo "$DELETE_LINE" | cut -d' ' -f3-)
+            iptables -t "$CHAIN" -D $RULE 2>/dev/null && echo "  ✓ Deleted: $RULE" && DELETED=$((DELETED+1)) || echo "  ✗ Failed: $RULE"
+        fi
+    done <<< "$RULES_POST"
+    
+    # Verify cleanup
+    echo "✅ Verifying cleanup..."
+    REMAINING=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -E "(to:10\.42\.0\.1:3001|to:10\.42\.0\.1:53)" || true)
+    REMAINING_POST=$(iptables -t nat -S POSTROUTING 2>/dev/null | grep -E "10\.42\.0\.0/24.*MASQUERADE" || true)
+    
+    if [ -n "$REMAINING" ] || [ -n "$REMAINING_POST" ]; then
+        echo "⚠️  WARNING: Some rules still remain, falling back to force flush..."
+        iptables -t nat -F PREROUTING 2>/dev/null || true
+        iptables -t nat -F POSTROUTING 2>/dev/null || true
+        echo "✅ Force flush completed"
+    else
+        echo "✅ Cleanup verified: $DELETED rules removed"
+    fi
+else
+    echo "ℹ️  No hotspot rules found"
+fi
+
 echo "✅ iptables rules cleaned"
 
 # ── Remove hotspot connection (if exists) ──────────────────
