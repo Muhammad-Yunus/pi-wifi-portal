@@ -424,8 +424,8 @@ def _flush_hotspot_iptables() -> None:
         # Convert -A to -D
         parts = rule_spec.split()
         if parts[0] == '-A':
-            parts[0] = '-D'
-            cmd = ["iptables", "-t", chain] + parts[1:]
+            # parts[0] = '-A', parts[1] = chain, parts[2:] = rest of rule
+            cmd = ["iptables", "-t", "nat", "-D", chain] + parts[2:]
             
             print(f"[wifi-portal] Deleting: {' '.join(parts[1:])}", flush=True)
             
