@@ -224,8 +224,16 @@ def scan_networks() -> list[dict]:
             ssid = ssid_raw.replace("\\:", ":")
             signal = parts[1]
             security = parts[2] if parts[2] else "Open"
-            networks.append({"ssid": ssid, "signal": signal, "sec": security})
-    return networks
+            # Skip empty SSID and hotspot itself
+            if ssid and ssid != HOTSPOT_SSID:
+                try:
+                    networks.append({"ssid": ssid, "signal": int(signal), "sec": security})
+                except ValueError:
+                    pass
+    
+    # Sort by signal strength (highest first) and return top 5
+    networks.sort(key=lambda x: x["signal"], reverse=True)
+    return networks[:5]
 
 
 def connect_to_network(ssid: str, password: str) -> dict:
